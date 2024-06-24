@@ -37,6 +37,8 @@ from pipeline_stable_diffusion_xl_instantid import (
     StableDiffusionXLInstantIDPipeline,
     draw_kps,
 )
+from celery import celery
+import multiprocessing
 
 mimetypes.add_type("image/webp", ".webp")
 
@@ -146,6 +148,27 @@ SDXL_NAME_TO_PATHLIKE = {
     },
 }
 
+# Set up Celery
+celery_app = Celery(
+    "sdxl_tasks",
+    broker=f'amqp://{os.getenv("RABBITMQ_USER")}:{os.getenv("RABBITMQ_PASS")}@{os.getenv("RABBITMQ_HOST")}:{os.getenv("RABBITMQ_PORT")}',
+)
+
+# Configure Celery
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+)
+
+
+@celery_app.task(name="execute_prediction")
+def execute_prediction(**kwargs):
+    predictor = Predictor()
+    return predictor.predict(**kwargs)
+
 
 def convert_from_cv2_to_image(img: np.ndarray) -> Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -180,9 +203,9 @@ def resize_img(
         res = np.ones([max_side, max_side, 3], dtype=np.uint8) * 255
         offset_x = (max_side - w_resize_new) // 2
         offset_y = (max_side - h_resize_new) // 2
-        res[offset_y : offset_y + h_resize_new, offset_x : offset_x + w_resize_new] = (
-            np.array(input_image)
-        )
+        res[
+            offset_y : offset_y + h_resize_new, offset_x : offset_x + w_resize_new
+        ] = np.array(input_image)
         input_image = Image.fromarray(res)
     return input_image
 
@@ -236,6 +259,10 @@ class Predictor(BasePredictor):
 
         self.load_weights("stable-diffusion-xl-base-1.0")
         self.setup_safety_checker()
+
+        ## Start Celery Worker
+        self.setup_celery()
+        self.start_celery_worker()
 
     def setup_safety_checker(self):
         print(f"[~] Seting up safety checker")
@@ -369,6 +396,25 @@ class Predictor(BasePredictor):
             "canny": get_canny_image,
             "depth": get_depth_map,
         }
+
+    def setup_celery(self):
+        self.celery_app = celery_app
+
+    def start_celery_worker(self):
+        def run_worker():
+            self.celery_app.worker_main(
+                ["worker", "--loglevel=info", "--concurrency=1"]
+            )
+
+        self.worker_process = multiprocessing.Process(target=run_worker)
+        self.worker_process.start()
+        print("Celery worker started")
+
+    def cleanup(self):
+        if hasattr(self, "worker_process"):
+            self.worker_process.terminate()
+            self.worker_process.join()
+            print("Celery worker stopped")
 
     def generate_image(
         self,
@@ -508,6 +554,40 @@ class Predictor(BasePredictor):
 
         return images
 
+    def is_url(self, path):
+        return path.startswith("http://") or path.startswith("https://")
+
+    def apply_lora_scales(self, adapter_name, scale):
+        self.pipe.set_adapters(adapter_name, scale)
+
+        print(f"Success - Lora: {adapter_name} loaded with scale: {scale}")
+
+    def is_adapter_loaded(self, adapter_name):
+        active_adapters = self.pipe.get_active_adapters()
+        return adapter_name in active_adapters
+
+    def load_style_lora_weight(self, weight, scale, adapter_name):
+        if self.is_adapter_loaded(adapter_name):
+            print(f"Adapter {adapter_name} is already loaded. Skipping.")
+            print(
+                f"DEBUG - Here are the currently loaded LoRAs: {self.pipe.get_active_adapters()}"
+            )
+            return
+
+        if self.is_url(weight):
+            remote_weight = self.weights_cache.ensure(weight)
+        else:
+            print(f"Loading LoRA weight: {weight} with adapter name: {adapter_name}")
+
+            # Load the LoRA weights
+            self.pipe.load_lora_weights(
+                pretrained_model_name_or_path_or_dict=weight,
+                adapter_name=adapter_name,
+            )
+
+            # Set the scale for the adapter
+            self.apply_lora_scales(adapter_name, scale)
+
     def predict(
         self,
         image: Path = Input(
@@ -577,6 +657,18 @@ class Predictor(BasePredictor):
             default=0.8,
             ge=0,
             le=1.5,
+        ),
+        style_lora_ID: str = Input(
+            description="ID/Name for LoRA",
+            default="",
+        ),
+        style_lora_path: str = Input(
+            description="List of LoRA weights to be loaded during prediction",
+            default="",
+        ),
+        style_lora_scale: float = Input(
+            description="Scales for LoRA weights loaded during prediction",
+            default=1.0,
         ),
         controlnet_conditioning_scale: float = Input(
             description="Scale for IdentityNet strength (for fidelity)",  # identitynet_strength_ratio
@@ -683,6 +775,23 @@ class Predictor(BasePredictor):
         if enable_lcm:
             num_inference_steps = lcm_num_inference_steps
             guidance_scale = lcm_guidance_scale
+
+        if style_lora_path:
+            print("Style Lora detected...")
+            lora_load_start = time.time()
+
+            print(
+                f"Attempting to load style LoRA: {style_lora_ID} at {style_lora_scale}"
+            )
+            self.load_style_lora_weight(
+                style_lora_path, style_lora_scale, style_lora_ID
+            )
+
+            print(f"Prediction LoRA load took: {time.time() - lora_load_start:.2f}s")
+
+        print(
+            f"DEBUG - LoRA's being used for Generation: {self.pipe.get_list_adapters()}"
+        )
 
         # Generate
         images = self.generate_image(
